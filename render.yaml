@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: powerwinner-strategy-simulator
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: SYMBOL
+        value: BTC
+      - key: DECISION_INTERVAL
+        value: "3"
+      - key: TRADE_WINDOW_SECONDS
+        value: "180"
+      - key: ORDER_SIZE
+        value: "10"
+      - key: DATA_DIR
+        value: /var/data
