@@ -145,6 +145,18 @@ VARIANTS = [
         "entry_cutoff_sec": 90,
     },
 
+    # 11-й вариант: исходный M03, но SWITCH разрешён только пока новая сторона дешёвая.
+    {
+        "name": "M03_V4_SW45",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 0.03,
+        "max_buys_side": 5,
+        "allow_switch": True,
+        "switch_price_max": 0.45,
+    },
+
 ]
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
@@ -881,6 +893,10 @@ async def evaluate_variant(market, variant, elapsed):
                 if not allow_switch:
                     continue
 
+                switch_price_max = variant.get("switch_price_max")
+                if switch_price_max is not None and ask > float(switch_price_max):
+                    continue
+
                 if mom >= variant["switch_move"]:
                     signal = "SWITCH"
 
@@ -1281,6 +1297,7 @@ def variant_summary(start_ms, end_ms):
                 "momentum_cap": v.get("momentum_cap", ""),
                 "allow_switch": v.get("allow_switch", True),
                 "entry_cutoff_sec": v.get("entry_cutoff_sec", ""),
+                "switch_price_max": v.get("switch_price_max", ""),
                 "markets_settled": len(rows),
                 "winning_markets": wins,
                 "losing_markets": losses,
@@ -1364,7 +1381,7 @@ def make_report(start_ts, end_ts):
     summary_cols = [
         "variant", "entry_move", "pyramid_step", "lookback_ticks",
         "switch_move", "max_buys_side", "entry_price_min", "entry_price_max",
-        "momentum_cap", "allow_switch", "entry_cutoff_sec", "markets_settled",
+        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max", "markets_settled",
         "winning_markets", "losing_markets", "paper_trades",
         "fees", "cost", "pnl", "roi_pct"
     ]
@@ -1473,7 +1490,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "1.5-m03v3",
+        "version": "1.6-m03v4",
         "symbol": SYMBOL,
         "decision_interval": DECISION_INTERVAL,
         "trade_window_seconds": TRADE_WINDOW_SECONDS,
@@ -1511,7 +1528,7 @@ async def main():
     init_db()
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.5",
+        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.6",
         "Accept": "application/json",
     })
 
