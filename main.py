@@ -157,6 +157,21 @@ VARIANTS = [
         "switch_price_max": 0.45,
     },
 
+    # 12-й вариант: динамический M03 V5.
+    # Первые 60 сек: дорогие SWITCH > 0.45 блокируются.
+    # После 60 сек: <=0.45 разрешены; 0.46-0.50 только при momentum < 0.10;
+    # 0.51-0.70 блокируются; >0.70 оставляем как у исходного M03 для проверки.
+    {
+        "name": "M03_V5_DYNAMIC",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 0.03,
+        "max_buys_side": 5,
+        "allow_switch": True,
+        "dynamic_switch_v5": True,
+    },
+
 ]
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
@@ -896,6 +911,17 @@ async def evaluate_variant(market, variant, elapsed):
                 switch_price_max = variant.get("switch_price_max")
                 if switch_price_max is not None and ask > float(switch_price_max):
                     continue
+
+                # M03 V5: dynamic SWITCH filter derived from the 120-market sample.
+                # Keep this rule fixed while collecting fresh out-of-sample data.
+                if variant.get("dynamic_switch_v5"):
+                    if elapsed <= 60.0 and ask > 0.45:
+                        continue
+                    if elapsed > 60.0:
+                        if 0.45 < ask <= 0.50 and mom >= 0.10:
+                            continue
+                        if 0.50 < ask <= 0.70:
+                            continue
 
                 if mom >= variant["switch_move"]:
                     signal = "SWITCH"
