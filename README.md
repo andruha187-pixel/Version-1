@@ -1,83 +1,48 @@
-# Powerwinner-Inspired Strategy Simulator v1
+# Strategy Simulator V3 — Binance Regime Research
 
-Paper-only strategy research bot.
+Отдельный out-of-sample тест. V1/V2 менять не нужно.
 
-It **does not copy Powerwinner** and it **does not place real orders**.
+## Что торгуется
+Все 12 исходных стратегий работают на Polymarket как BASE и не изменены.
+Binance BTCUSDT Futures используется только как внешний фильтр.
 
-## Purpose
+## Контроль
+CONF60 — тот же порог confidence >= 60 из V2.
 
-We observed several structural patterns in Powerwinner's BTC 5-minute activity:
+## Новые V3 shadow-фильтры
+- V3_REGIME:
+  CONF60 + regime != MIXED
 
-- approximately 3-second decision cadence
-- trading concentrated in the first ~180 seconds
-- fixed-lot execution
-- adding to a side after its contract price rises
-- switching sides when momentum changes
-- holding positions through resolution
+- V3_DIR100:
+  CONF60 + direction_changes >= 100
 
-This bot tests that family of ideas independently.
+- V3_REGIME_OR_DIR100:
+  CONF60 + (regime != MIXED OR direction_changes >= 100)
+  Это главный кандидат для проверки на новых данных.
 
-## What it does
+- V3_PATH025:
+  CONF60 + path_efficiency <= 0.25
 
-1. Discovers live BTC Up/Down markets.
-2. Subscribes to both outcome order books over the public CLOB WebSocket.
-3. Samples ask prices every ~3 seconds.
-4. Runs 8 candidate momentum/pyramiding variants simultaneously.
-5. Simulates taker fills through the actual visible ask depth.
-6. Applies Polymarket crypto taker fees.
-7. Settles each variant after the market resolves.
-8. Ranks variants by realized PnL and ROI.
+- V3_EXHAUST_GUARD:
+  CONF60, но блокирует потенциально поздний/выдохшийся импульс,
+  если BTC уже заметно ушёл от цены старта 5m и за последнюю 1 секунду
+  всё ещё резко идёт в ту же сторону.
 
-## Variants
+## Binance-признаки
+V3 сохраняет все признаки V2:
+250ms/500ms/1s/3s/10s returns, flow 1/3/10/30s,
+book imbalance, large trades, EMA9/21, RSI14,
+distance from 5m start, path efficiency, direction changes,
+TREND/MIXED/CHOP и confidence.
 
-Examples:
+## ZIP каждый час
+- обычные BASE-файлы
+- binance_v3_features.csv
+- binance_shadow_trades.csv
+- binance_shadow_results.csv
+- binance_shadow_summary.csv
+- report.txt
 
-- `M03_P08_L2`
-  - first entry after +0.03 contract-price momentum
-  - pyramid after +0.08 above previous buy
-  - 2 ticks = ~6 second momentum lookback
+В report.txt есть TOP-20 комбинаций и V3 MODE ROLLUP.
 
-- `M08_P12_L3`
-  - first entry after +0.08
-  - pyramid after +0.12
-  - 3 ticks = ~9 second lookback
-
-We deliberately test several variants instead of assuming one exact formula.
-
-## Telegram ZIP
-
-Every completed UTC hour:
-
-- `variants_summary.csv`
-- `paper_trades.csv`
-- `signals.csv`
-- `market_results.csv`
-- `markets.csv`
-- `report.txt`
-
-Upload the ZIP files back to ChatGPT. We can then refine the parameter grid.
-
-## Render
-
-Use a **separate repository and separate Render service**.
-
-Build:
-
-`pip install -r requirements.txt`
-
-Start:
-
-`python main.py`
-
-Environment variables required:
-
-- `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_CHAT_ID`
-
-Recommended persistent disk mount:
-
-`/var/data`
-
-## Important
-
-This is an experimental paper simulation. A profitable short run is not enough to establish a robust strategy. We need many resolved markets and should test out-of-sample periods before considering any real-money implementation.
+ВАЖНО: не менять пороги во время серии, иначе out-of-sample тест теряет смысл.
