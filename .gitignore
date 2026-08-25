@@ -1,7 +1,2 @@
-.env
-*.db
-*.db-shm
-*.db-wal
-reports/
-__pycache__/
-.pytest_cache/
+# Created by pytest automatically.
+*
