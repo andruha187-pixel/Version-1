@@ -1,13 +1,31 @@
 services:
   - type: web
-    name: strategy-binance-v3
+    name: polymarket-weather-paper-bot
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
-    healthCheckPath: /health
+    healthCheckPath: /healthz
+    disk:
+      name: weather-paper-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
-      - key: DATA_DIR
-        value: /var/data
-      - key: BINANCE_SYMBOL
-        value: btcusdt
+      - key: PYTHON_VERSION
+        value: 3.13.7
+      - key: DB_PATH
+        value: /var/data/weather_paper.db
+      - key: REPORT_DIR
+        value: /var/data/reports
+      - key: THRESHOLDS
+        value: 0.79,0.84,0.89
+      - key: TRADE_NOTIONAL_USD
+        value: 5
+      - key: START_BALANCE_USD
+        value: 1000
+      - key: HOURLY_REPORTS
+        value: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
