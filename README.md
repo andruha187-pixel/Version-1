@@ -1,63 +1,138 @@
-# Polymarket Highest Temperature — Paper Trading Bot
+# Polymarket Highest Temperature — Paper Bot v2.2
 
-This bot is **paper trading only**. It contains no wallet, private key, signing code, real order placement, or on-chain redeem call.
+**Paper trading only.** There is no wallet, private key, order signing, real order placement, or on-chain redeem call in this project.
 
-It watches active Polymarket events whose title/slug matches **Highest temperature in ...** and runs three independent virtual strategies:
+The bot tracks Polymarket **Highest temperature in ...** markets and compares three independent virtual strategies:
 
-- T79: crosses from below 0.79 to 0.79 or higher
-- T84: crosses from below 0.84 to 0.84 or higher
-- T89: crosses from below 0.89 to 0.89 or higher
+- **T79** — live YES ask crosses from below 0.79 to 0.79 or higher
+- **T84** — live YES ask crosses from below 0.84 to 0.84 or higher
+- **T89** — live YES ask crosses from below 0.89 to 0.89 or higher
 
-Default virtual order size: **$5 notional**. Default balance: **$1,000 per strategy**.
+Default paper order: **$5 notional**. Default virtual balance: **$1,000 per strategy**.
 
-## Important simulation rules
+## New in v2.2 — entry liquidity filter
 
-1. A market already above a threshold when the bot first sees it is **not bought**. The first quote only arms the tracker.
-2. A trade occurs only after a live crossing: `previous ask < threshold <= new ask`.
-3. Each strategy can trade a particular binary temperature market only once.
-4. The fill is simulated against the public CLOB **ask depth**, not the displayed midpoint.
-5. By default the full $5 must be fillable; otherwise the signal is logged as skipped.
-6. Taker fees are included. Per-market CLOB fee details are queried when possible; current Weather fee rate is used as a fallback.
-7. Open PnL is marked at **best bid**, i.e. the realistic liquidation side.
-8. Resolution is detected by WebSocket when available and also polled through Gamma as a fallback.
-9. On resolution the bot performs a **virtual redeem** immediately: YES shares settle to the resolved YES value (normally $1 or $0).
-10. Every signal, fill, fee, resolution, payout and PnL stays in SQLite.
+Before every paper buy the bot now reads the public YES ask book and requires enough **near-best-ask depth** for a realistic $5 execution.
 
-## Files
+Defaults:
 
-- `main.py` — complete bot, dashboard, Telegram commands, reports
-- `requirements.txt` — Python dependencies
-- `.env.example` — settings
-- `render.yaml` — Render Blueprint including a 1 GB persistent disk
+```text
+ENTRY_LIQUIDITY_CHECK_ENABLED=true
+MIN_ENTRY_LIQUIDITY_USD=5
+MAX_ENTRY_SLIPPAGE=0.02
+```
+
+That means the bot only considers ask levels from the current best ask through **best ask + $0.02**. The combined dollar notional in that window must be at least $5, and the complete $5 paper order must still be fillable.
+
+Example: if only $0.50 is offered around 0.79 and the next meaningful liquidity is at 0.95, the signal is recorded as `SKIPPED / INSUFFICIENT_NEAR_ASK_LIQUIDITY`; no paper position is opened. This prevents thin books from producing unrealistic entries.
+
+The skipped signal remains in `signals.csv`, including available/required liquidity and the allowed price range in the reason field.
+
+## Fixed in v2.1 — protection from false post-resolution entries
+
+This build includes a regression fix for the Denver-style false redeem/entry sequence:
+
+- embedded Gamma markets with `closed=true`, `active=false`, or `acceptingOrders=false` are not subscribed as new entry candidates;
+- immediately before a paper buy or stop-loss exit, the bot re-checks Gamma market status and refuses execution when orders are explicitly no longer accepted;
+- an exact terminal YES ask of `1.000` can never create a 0.79/0.84/0.89 crossing signal;
+- after every CLOB WebSocket reconnect, the first fresh quote becomes a new baseline instead of being compared with a stale pre-disconnect quote;
+- once a market has been explicitly resolved in this process, later CLOB quotes cannot create a new entry or stop-loss;
+- the first quote for every newly seen market remains arming-only.
+
+`endDate` is deliberately **not** treated as an exact trading cutoff because weather markets may continue accepting orders around/after that calendar marker. Explicit Polymarket order-acceptance/resolution status is used instead.
+
+## New in v2
+
+### Telegram buttons
+
+The `/start` or `/help` command shows four inline buttons:
+
+- **▶️ Старт** — enables new paper entries
+- **⏹ Стоп** — pauses new paper entries
+- **📂 Позиции** — shows currently open positions
+- **📊 Отчёт** — sends current statistics and a ZIP report
+
+The Start/Stop state is stored in SQLite and survives normal restarts/redeploys when the database is on the Render persistent disk.
+
+**Important:** `⏹ Стоп` pauses only *new entries*. Existing positions are still monitored, the stop-loss stays active, and official market resolution/redeem processing continues.
+
+### Paper stop-loss at $0.40
+
+By default:
+
+```text
+STOP_LOSS_ENABLED=true
+STOP_LOSS_PRICE=0.40
+```
+
+The trigger uses the executable side of the market: **YES best bid <= $0.40**.
+
+When triggered, the bot simulates selling the entire YES position against the real public CLOB **bid depth**, highest bid first. It does **not** pretend the exit happened exactly at $0.40. If the market gaps below the stop, the simulated fill uses the actual available lower bids.
+
+If the full small paper position cannot be sold from visible bid liquidity, the bot does not invent a fill; it leaves the position open and retries while the stop condition remains active.
+
+Exit taker fees are included in realized PnL. A stopped trade is recorded with status `STOP_LOSS`, trigger bid, average exit price, gross proceeds, exit fee, net proceeds, and realized PnL.
+
+## Simulation rules
+
+1. A market already above a threshold when first observed is not bought. The first quote only arms the tracker.
+2. Entry requires a live crossing: `previous ask < threshold <= new ask`.
+3. T79/T84/T89 are independent portfolios.
+4. Entry fills use real public CLOB ask depth.
+5. Entry requires at least $5 of ask liquidity within $0.02 of the current best ask by default.
+6. Far-away asks outside that slippage window are ignored.
+7. Stop-loss exits use real public CLOB bid depth.
+8. By default the whole $5 entry must be fillable; otherwise the signal is skipped.
+9. Taker fees are included on entry and stop-loss exit.
+10. Open PnL is marked at best bid.
+11. Resolution is detected by WebSocket and also polled through Gamma as a fallback.
+12. Open winning/losing positions not stopped out are virtually redeemed after official resolution.
+13. Signals, fills, fees, stop exits, resolutions, payouts and PnL are stored in SQLite.
 
 ## Render deployment
 
-1. Upload these files to a GitHub repository.
-2. In Render, create a Blueprint/Web Service from the repository (or create a Python Web Service manually).
-3. Add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` environment variables if you want Telegram notifications/reports.
-4. Keep the persistent disk mounted at `/var/data`. SQLite and reports must live there or they will be lost on redeploy.
-5. Deploy.
+Upload all files in this folder to a GitHub repository and create a Render Blueprint/Web Service.
 
-`render.yaml` already uses:
+`render.yaml` creates a separate service named `polymarket-weather-paper-bot-v2` with a persistent disk and uses:
 
-- build: `pip install -r requirements.txt`
-- start: `python main.py`
-- health check: `/healthz`
-- database: `/var/data/weather_paper.db`
+- database: `/var/data/weather_paper_v2.db`
+- reports: `/var/data/reports_v2`
+- stop-loss: `$0.40`
+- strategies: `0.79,0.84,0.89`
+- order: `$5`
 
-## Telegram commands
+Add these secrets in Render:
 
-- `/status` — balances, PnL, ROI, W/L, drawdown
-- `/stats` — strategy comparison
+```text
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+### If the old bot is still running
+
+Do **not** run the old service and this new service at the same time with the **same Telegram bot token**. Both use Telegram `getUpdates` polling and they can consume each other's button/command updates.
+
+Either:
+
+- keep the old bot running and only deploy v2 after stopping it, or
+- create a second Telegram bot/token for v2 if you want both services running simultaneously.
+
+The Polymarket paper logic itself can run simultaneously; the conflict concerns Telegram polling with the same token.
+
+## Other Telegram commands
+
+- `/status` or `/stats` — balance, PnL, ROI, W/L, stop-loss count, drawdown
 - `/open` — open positions
 - `/last` — latest trades
-- `/markets` — number of tracked city/date events and YES markets
-- `/report` — generate and send a ZIP report immediately
-- `/help` — commands
+- `/markets` — tracked events/markets
+- `/report` — current status + ZIP report
+- `/help` — show the button menu
 
-When `HOURLY_REPORTS=true`, the bot sends a status plus ZIP report every hour.
+When `HOURLY_REPORTS=true`, status and ZIP statistics are still sent every hour even if new entries are paused.
 
-## ZIP report contents
+## ZIP report
+
+Contains:
 
 - `summary.csv`
 - `trades.csv`
@@ -67,18 +142,12 @@ When `HOURLY_REPORTS=true`, the bot sends a status plus ZIP report every hour.
 - `equity_snapshots.csv`
 - `about.txt`
 
+The `trades.csv` file includes stop-loss exit details.
+
 ## Web dashboard
 
-Open the Render service URL. The dashboard refreshes every 30 seconds and shows all three strategies side-by-side.
-
-Endpoints:
-
-- `/` — dashboard
+- `/` — dashboard, refreshes every 30 seconds
 - `/healthz` — health check
 - `/api/status` — JSON status
 
-If you set `DASHBOARD_TOKEN`, open the dashboard as `/?token=YOUR_TOKEN`.
-
-## Strategy comparison
-
-The three portfolios are deliberately independent. A move from 0.78 to 0.90 can therefore trigger T79, T84 and T89 at the same live order-book state, which makes the eventual PnL/ROI comparison fair instead of making the strategies compete for one shared virtual bankroll.
+The dashboard shows whether new entries are RUNNING/STOPPED and the configured stop-loss.

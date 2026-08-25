@@ -101,7 +101,14 @@ EQUITY_SNAPSHOT_INTERVAL = env_int("EQUITY_SNAPSHOT_INTERVAL_SECONDS", 60)
 HOURLY_REPORTS = env_bool("HOURLY_REPORTS", True)
 REQUIRE_FULL_FILL = env_bool("REQUIRE_FULL_FILL", True)
 MIN_FULL_FILL_RATIO = env_float("MIN_FULL_FILL_RATIO", 0.999)
+ENTRY_LIQUIDITY_CHECK_ENABLED = env_bool("ENTRY_LIQUIDITY_CHECK_ENABLED", True)
+MIN_ENTRY_LIQUIDITY_USD = max(0.0, env_float("MIN_ENTRY_LIQUIDITY_USD", TRADE_NOTIONAL_USD))
+MAX_ENTRY_SLIPPAGE = max(0.0, env_float("MAX_ENTRY_SLIPPAGE", 0.02))
 WEATHER_FEE_RATE_FALLBACK = env_float("WEATHER_FEE_RATE_FALLBACK", 0.05)
+STOP_LOSS_ENABLED = env_bool("STOP_LOSS_ENABLED", True)
+STOP_LOSS_PRICE = min(0.999, max(0.001, env_float("STOP_LOSS_PRICE", 0.40)))
+STOP_LOSS_SCAN_INTERVAL = max(1, env_int("STOP_LOSS_SCAN_INTERVAL_SECONDS", 5))
+TRADING_ENABLED_ON_START = env_bool("TRADING_ENABLED_ON_START", True)
 PORT = env_int("PORT", 8080)
 DB_PATH = default_db_path()
 REPORT_DIR = os.getenv("REPORT_DIR") or str(Path(DB_PATH).parent / "reports")
@@ -261,6 +268,21 @@ class FillResult:
         return self.filled_notional / self.requested_notional
 
 
+@dataclass(slots=True)
+class SellFillResult:
+    requested_shares: float
+    sold_shares: float
+    gross_proceeds: float
+    avg_price: float | None
+    levels: list[dict[str, float]] = field(default_factory=list)
+
+    @property
+    def full_fill_ratio(self) -> float:
+        if self.requested_shares <= 0:
+            return 0.0
+        return self.sold_shares / self.requested_shares
+
+
 # -----------------------------------------------------------------------------
 # SQLite storage
 # -----------------------------------------------------------------------------
@@ -362,6 +384,14 @@ class Database:
                 resolution_source TEXT,
                 resolved_at TEXT,
                 redeemed_at TEXT,
+                exit_reason TEXT,
+                exit_time TEXT,
+                exit_price REAL,
+                exit_gross_proceeds REAL,
+                exit_fee REAL NOT NULL DEFAULT 0,
+                exit_net_proceeds REAL,
+                exit_levels_json TEXT,
+                stop_trigger_bid REAL,
                 UNIQUE(strategy, market_id)
             );
 
@@ -391,6 +421,21 @@ class Database:
             );
             """
         )
+        # Forward-compatible migration for databases created by the first paper-bot version.
+        existing_trade_cols = {str(r[1]) for r in self.conn.execute("PRAGMA table_info(trades)").fetchall()}
+        migrations = {
+            "exit_reason": "TEXT",
+            "exit_time": "TEXT",
+            "exit_price": "REAL",
+            "exit_gross_proceeds": "REAL",
+            "exit_fee": "REAL NOT NULL DEFAULT 0",
+            "exit_net_proceeds": "REAL",
+            "exit_levels_json": "TEXT",
+            "stop_trigger_bid": "REAL",
+        }
+        for col, ddl in migrations.items():
+            if col not in existing_trade_cols:
+                self.conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {ddl}")
         self.conn.commit()
 
     def set_meta(self, key: str, value: str) -> None:
@@ -574,12 +619,50 @@ class Database:
         self.conn.commit()
         return settled
 
+    def close_stop_loss(
+        self,
+        trade_id: int,
+        trigger_bid: float,
+        sell: SellFillResult,
+        exit_fee: float,
+    ) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM trades WHERE id=? AND status='OPEN'",
+            (trade_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        net = float(sell.gross_proceeds) - float(exit_fee)
+        pnl = net - float(row["cash_debit"])
+        now = iso_now()
+        self.conn.execute(
+            """
+            UPDATE trades
+            SET status='STOP_LOSS', payout=?, pnl=?, exit_reason='STOP_LOSS', exit_time=?,
+                exit_price=?, exit_gross_proceeds=?, exit_fee=?, exit_net_proceeds=?,
+                exit_levels_json=?, stop_trigger_bid=?
+            WHERE id=? AND status='OPEN'
+            """,
+            (
+                net, pnl, now, sell.avg_price, sell.gross_proceeds, exit_fee, net,
+                json.dumps(sell.levels, separators=(",", ":")), trigger_bid, trade_id,
+            ),
+        )
+        self.conn.commit()
+        data = dict(row)
+        data.update({
+            "status": "STOP_LOSS", "payout": net, "pnl": pnl, "exit_time": now,
+            "exit_price": sell.avg_price, "exit_gross_proceeds": sell.gross_proceeds,
+            "exit_fee": exit_fee, "exit_net_proceeds": net, "stop_trigger_bid": trigger_bid,
+        })
+        return data
+
     def free_cash(self, strategy: str) -> float:
         row = self.conn.execute(
             """
             SELECT
               COALESCE(SUM(cash_debit),0) AS debits,
-              COALESCE(SUM(CASE WHEN status='REDEEMED' THEN payout ELSE 0 END),0) AS payouts
+              COALESCE(SUM(CASE WHEN status IN ('REDEEMED','STOP_LOSS') THEN payout ELSE 0 END),0) AS payouts
             FROM trades WHERE strategy=?
             """,
             (strategy,),
@@ -590,6 +673,12 @@ class Database:
         if strategy:
             return list(self.conn.execute("SELECT * FROM trades WHERE status='OPEN' AND strategy=? ORDER BY fill_time", (strategy,)))
         return list(self.conn.execute("SELECT * FROM trades WHERE status='OPEN' ORDER BY fill_time"))
+
+    def open_trades_by_token(self, token_id: str) -> list[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM trades WHERE status='OPEN' AND yes_token_id=? ORDER BY id",
+            (token_id,),
+        ))
 
     def open_market_ids(self) -> list[str]:
         rows = self.conn.execute("SELECT DISTINCT market_id FROM trades WHERE status='OPEN'").fetchall()
@@ -616,11 +705,12 @@ class Database:
             SELECT
               COUNT(*) AS trades,
               SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) AS open_count,
-              SUM(CASE WHEN status='REDEEMED' THEN 1 ELSE 0 END) AS resolved_count,
-              SUM(CASE WHEN status='REDEEMED' AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
-              SUM(CASE WHEN status='REDEEMED' AND pnl < 0 THEN 1 ELSE 0 END) AS losses,
-              COALESCE(SUM(CASE WHEN status='REDEEMED' THEN pnl ELSE 0 END),0) AS realized_pnl,
-              COALESCE(SUM(taker_fee),0) AS fees,
+              SUM(CASE WHEN status IN ('REDEEMED','STOP_LOSS') THEN 1 ELSE 0 END) AS resolved_count,
+              SUM(CASE WHEN status='STOP_LOSS' THEN 1 ELSE 0 END) AS stop_loss_count,
+              SUM(CASE WHEN status IN ('REDEEMED','STOP_LOSS') AND pnl > 0 THEN 1 ELSE 0 END) AS wins,
+              SUM(CASE WHEN status IN ('REDEEMED','STOP_LOSS') AND pnl < 0 THEN 1 ELSE 0 END) AS losses,
+              COALESCE(SUM(CASE WHEN status IN ('REDEEMED','STOP_LOSS') THEN pnl ELSE 0 END),0) AS realized_pnl,
+              COALESCE(SUM(taker_fee + COALESCE(exit_fee,0)),0) AS fees,
               COALESCE(AVG(avg_fill_price),0) AS avg_entry
             FROM trades WHERE strategy=?
             """,
@@ -655,6 +745,7 @@ class Database:
             "trades": int(row["trades"] or 0),
             "open_count": int(row["open_count"] or 0),
             "resolved_count": resolved,
+            "stop_loss_count": int(row["stop_loss_count"] or 0),
             "wins": wins,
             "losses": int(row["losses"] or 0),
             "win_rate": win_rate,
@@ -722,14 +813,26 @@ class TelegramClient:
     def api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
-    async def send_message(self, text: str, chat_id: str | int | None = None) -> None:
+    async def send_message(
+        self,
+        text: str,
+        chat_id: str | int | None = None,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
         target = chat_id if chat_id is not None else self.default_chat_id
         if not self.enabled or target is None:
             return
+        payload: dict[str, Any] = {
+            "chat_id": target,
+            "text": text[:4096],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
         try:
             async with self.session.post(
                 self.api_url("sendMessage"),
-                json={"chat_id": target, "text": text[:4096], "disable_web_page_preview": True},
+                json=payload,
                 timeout=HTTP_TIMEOUT,
             ) as resp:
                 if resp.status >= 300:
@@ -757,7 +860,7 @@ class TelegramClient:
     async def get_updates(self) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
-        payload = {"offset": self.offset, "timeout": 25, "allowed_updates": ["message"]}
+        payload = {"offset": self.offset, "timeout": 25, "allowed_updates": ["message", "callback_query"]}
         try:
             async with self.session.get(
                 self.api_url("getUpdates"), params=payload, timeout=ClientTimeout(total=35)
@@ -774,6 +877,20 @@ class TelegramClient:
         except Exception as exc:
             log.debug("Telegram getUpdates error: %s", exc)
             return []
+
+    async def answer_callback(self, callback_id: str, text: str = "") -> None:
+        if not self.enabled or not callback_id:
+            return
+        try:
+            async with self.session.post(
+                self.api_url("answerCallbackQuery"),
+                json={"callback_query_id": callback_id, "text": text[:200]},
+                timeout=HTTP_TIMEOUT,
+            ) as resp:
+                if resp.status >= 300:
+                    log.debug("Telegram answerCallbackQuery failed: %s", resp.status)
+        except Exception as exc:
+            log.debug("Telegram callback answer error: %s", exc)
 
 
 # -----------------------------------------------------------------------------
@@ -802,10 +919,18 @@ class WeatherPaperBot:
         self.dynamic_subscribe_queue: asyncio.Queue[str] = asyncio.Queue()
         self.stop_event = asyncio.Event()
         self.pending_crossings: set[str] = set()
+        self.pending_stop_losses: set[int] = set()
+        # Resolved markets can continue emitting terminal CLOB prices briefly.
+        # Never allow those prices to create a new paper entry/stop.
+        self.closed_market_ids: set[str] = set()
+        saved_trading_state = self.db.get_meta("trading_enabled")
+        self.trading_enabled = (
+            TRADING_ENABLED_ON_START if saved_trading_state is None else saved_trading_state == "1"
+        )
 
     async def start(self) -> None:
         connector = aiohttp.TCPConnector(limit=100, ttl_dns_cache=300)
-        self.session = ClientSession(timeout=HTTP_TIMEOUT, connector=connector, headers={"User-Agent": "polymarket-weather-paper-bot/1.0"})
+        self.session = ClientSession(timeout=HTTP_TIMEOUT, connector=connector, headers={"User-Agent": "polymarket-weather-paper-bot/2.2"})
         self.telegram = TelegramClient(self.session)
         self.load_cached_markets()
         await self.discover_markets()
@@ -815,6 +940,7 @@ class WeatherPaperBot:
             asyncio.create_task(self.discovery_loop(), name="discovery"),
             asyncio.create_task(self.websocket_loop(), name="websocket"),
             asyncio.create_task(self.resolution_loop(), name="resolution"),
+            asyncio.create_task(self.stop_loss_scan_loop(), name="stop-loss-scan"),
             asyncio.create_task(self.price_snapshot_loop(), name="price-snapshots"),
             asyncio.create_task(self.equity_snapshot_loop(), name="equity-snapshots"),
             asyncio.create_task(self.telegram_loop(), name="telegram"),
@@ -828,13 +954,14 @@ class WeatherPaperBot:
             f"Strategies: {', '.join(f'{t:.2f}' for t in THRESHOLDS)}\n"
             f"Paper order: ${TRADE_NOTIONAL_USD:.2f} each\n"
             f"Balance: ${START_BALANCE_USD:.2f} per strategy\n"
+            f"Entry liquidity: ${MIN_ENTRY_LIQUIDITY_USD:.2f} within +${MAX_ENTRY_SLIPPAGE:.2f} of best ask\n"
             f"Tracked city/date events: {events}\n"
             f"Tracked YES markets: {markets}\n"
             "REAL TRADING: disabled"
         )
         log.info(startup.replace("\n", " | "))
         if self.telegram:
-            await self.telegram.send_message(startup)
+            await self.telegram.send_message(startup, reply_markup=self.telegram_keyboard())
 
         try:
             await self.stop_event.wait()
@@ -844,6 +971,25 @@ class WeatherPaperBot:
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.session:
                 await self.session.close()
+
+    @staticmethod
+    def telegram_keyboard() -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "▶️ Старт", "callback_data": "paper_start"},
+                    {"text": "⏹ Стоп", "callback_data": "paper_stop"},
+                ],
+                [
+                    {"text": "📂 Позиции", "callback_data": "paper_positions"},
+                    {"text": "📊 Отчёт", "callback_data": "paper_report"},
+                ],
+            ]
+        }
+
+    def set_trading_enabled(self, enabled: bool) -> None:
+        self.trading_enabled = bool(enabled)
+        self.db.set_meta("trading_enabled", "1" if enabled else "0")
 
     def load_cached_markets(self) -> None:
         for row in self.db.load_markets():
@@ -889,6 +1035,31 @@ class WeatherPaperBot:
                 text = await resp.text()
                 raise RuntimeError(f"CLOB {resp.status}: {text[:250]}")
             return await resp.json(content_type=None)
+
+    async def market_accepting_orders(self, m: MarketInfo) -> bool:
+        """Reject an entry/stop only when Gamma explicitly says the market is not tradable.
+
+        Gamma can briefly lag during resolution, so network/unknown status falls back to
+        True; terminal $1 websocket quotes are separately blocked in handle_top.
+        """
+        if m.market_id in self.closed_market_ids:
+            return False
+        try:
+            market = await self.gamma_get(f"/markets/{m.market_id}")
+        except Exception as exc:
+            log.debug("Market status verification failed market=%s: %s", m.market_id, exc)
+            return True
+        if not isinstance(market, dict):
+            return True
+        if market.get("closed") is True:
+            return False
+        if market.get("active") is False:
+            return False
+        if market.get("acceptingOrders") is False or market.get("accepting_orders") is False:
+            return False
+        if market.get("enableOrderBook") is False or market.get("enable_order_book") is False:
+            return False
+        return True
 
     async def discover_markets(self) -> int:
         events: dict[str, dict[str, Any]] = {}
@@ -957,10 +1128,11 @@ class WeatherPaperBot:
             for market in event.get("markets") or []:
                 if not isinstance(market, dict):
                     continue
-                if market.get("closed") is True:
+                if market.get("closed") is True or market.get("active") is False:
                     continue
-                if market.get("enableOrderBook") is False:
+                if market.get("enableOrderBook") is False or market.get("acceptingOrders") is False:
                     continue
+                market_end = market.get("endDate") or event_end
                 yes_token, no_token = yes_token_from_market(market)
                 if not yes_token:
                     continue
@@ -977,7 +1149,7 @@ class WeatherPaperBot:
                     market_slug=str(market.get("slug") or ""),
                     question=str(market.get("question") or ""),
                     temperature_label=market_temperature_label(market),
-                    end_date=str(market.get("endDate") or event_end or "") or None,
+                    end_date=str(market_end or "") or None,
                     yes_token_id=yes_token,
                     no_token_id=no_token,
                     fees_enabled=enabled,
@@ -1034,6 +1206,10 @@ class WeatherPaperBot:
                     await asyncio.sleep(10)
                     continue
                 log.info("Connecting CLOB WebSocket; YES assets=%d", len(tokens))
+                # A reconnect is a data gap. Do not compare the first fresh quote to a
+                # possibly hours-old pre-disconnect ask and call that a threshold crossing.
+                for token in tokens:
+                    self.last_asks.pop(token, None)
                 async with self.session.ws_connect(CLOB_WS, heartbeat=None, receive_timeout=40, max_msg_size=4 * 1024 * 1024) as ws:
                     self.ws = ws
                     self.ws_connected = True
@@ -1192,16 +1368,40 @@ class WeatherPaperBot:
         except (TypeError, ValueError):
             top.timestamp_ms = int(time.time() * 1000)
 
+        m = self.markets_by_yes.get(token)
+        if not m:
+            return
+
+        # A resolved market can continue emitting terminal CLOB prices briefly.
+        # endDate is intentionally NOT used here: for weather events it is a calendar
+        # marker and is not always the exact moment order acceptance stops.
+        market_ended = m.market_id in self.closed_market_ids
+
+        # Risk management remains active while entries are paused, but never after
+        # an explicit resolution; after that we only wait for/record settlement.
+        if (
+            not market_ended
+            and STOP_LOSS_ENABLED
+            and bid is not None
+            and 0 < bid <= STOP_LOSS_PRICE
+        ):
+            self.maybe_trigger_stop_losses(token, bid)
+
         if ask is None or not (0 < ask <= 1):
             return
         previous = self.last_asks.get(token)
         self.last_asks[token] = ask
         if previous is None:
-            # Startup/new-market arming: never backfill an already-high price.
+            # Startup/new-market/reconnect arming: first quote is baseline only.
             return
-
-        m = self.markets_by_yes.get(token)
-        if not m:
+        if market_ended:
+            return
+        # Exact $1 asks are common around settlement. Never treat a boundary quote
+        # as a fresh 0.79/0.84/0.89 crossing even if an upstream status is stale.
+        if ask >= 1.0 - 1e-12:
+            return
+        if not self.trading_enabled:
+            # Keep tracking prices while paused, but do not consume/record entry signals.
             return
         crossed: list[tuple[float, str, int]] = []
         for threshold in THRESHOLDS:
@@ -1237,6 +1437,139 @@ class WeatherPaperBot:
             log.warning("REST orderbook fetch failed token=%s: %s", token[-8:], exc)
         cached = self.books.get(token, {}).get("asks", {})
         return [{"price": p, "size": s} for p, s in sorted(cached.items())]
+
+    async def fetch_bid_levels(self, token: str) -> list[dict[str, float]]:
+        try:
+            data = await self.clob_get("/book", {"token_id": token})
+            bids = data.get("bids") or [] if isinstance(data, dict) else []
+            levels = []
+            for x in bids:
+                p = as_float(x.get("price")) if isinstance(x, dict) else None
+                s = as_float(x.get("size")) if isinstance(x, dict) else None
+                if p is not None and s is not None and 0 < p <= 1 and s > 0:
+                    levels.append({"price": p, "size": s})
+            if levels:
+                return sorted(levels, key=lambda x: x["price"], reverse=True)
+        except Exception as exc:
+            log.warning("REST bid book fetch failed token=%s: %s", token[-8:], exc)
+        cached = self.books.get(token, {}).get("bids", {})
+        return [{"price": p, "size": s} for p, s in sorted(cached.items(), reverse=True)]
+
+    @staticmethod
+    def simulate_market_sell(bids: list[dict[str, float]], target_shares: float) -> SellFillResult:
+        remaining = target_shares
+        sold = 0.0
+        proceeds = 0.0
+        levels_used: list[dict[str, float]] = []
+        for lvl in sorted(bids, key=lambda x: x["price"], reverse=True):
+            p = float(lvl["price"])
+            available_shares = float(lvl["size"])
+            if p <= 0 or p > 1 or available_shares <= 0 or remaining <= 1e-10:
+                continue
+            qty = min(remaining, available_shares)
+            notional = qty * p
+            sold += qty
+            proceeds += notional
+            remaining -= qty
+            levels_used.append({"price": p, "shares": qty, "notional": notional})
+        avg = proceeds / sold if sold > 0 else None
+        return SellFillResult(target_shares, sold, proceeds, avg, levels_used)
+
+    def maybe_trigger_stop_losses(self, token: str, trigger_bid: float) -> None:
+        for tr in self.db.open_trades_by_token(token):
+            trade_id = int(tr["id"])
+            if trade_id in self.pending_stop_losses:
+                continue
+            self.pending_stop_losses.add(trade_id)
+            asyncio.create_task(self.process_stop_loss(trade_id, token, trigger_bid))
+
+    async def process_stop_loss(self, trade_id: int, token: str, trigger_bid: float) -> None:
+        try:
+            current_rows = [r for r in self.db.open_trades_by_token(token) if int(r["id"]) == trade_id]
+            if not current_rows:
+                return
+            tr = current_rows[0]
+            bids = await self.fetch_bid_levels(token)
+            sell = self.simulate_market_sell(bids, float(tr["shares"]))
+            if sell.sold_shares <= 0 or sell.avg_price is None:
+                log.warning("STOP LOSS no bid liquidity trade=%s token=%s", trade_id, token[-8:])
+                return
+            # A stop is modeled as a market/FOK exit; do not pretend unsold shares disappeared.
+            if sell.full_fill_ratio < MIN_FULL_FILL_RATIO:
+                log.warning(
+                    "STOP LOSS insufficient bid liquidity trade=%s fill_ratio=%.4f",
+                    trade_id, sell.full_fill_ratio,
+                )
+                return
+            m = self.markets_by_yes.get(token)
+            if not m:
+                return
+            if m.market_id in self.closed_market_ids:
+                return
+            if not await self.market_accepting_orders(m):
+                # Do not manufacture a stop from settlement/closed-book quotes.
+                return
+            fee_rate = await self.get_fee_rate(m)
+            fee_fill = FillResult(
+                requested_notional=sell.gross_proceeds,
+                filled_notional=sell.gross_proceeds,
+                shares=sell.sold_shares,
+                avg_price=sell.avg_price,
+                levels=sell.levels,
+            )
+            exit_fee = self.taker_fee(fee_fill, fee_rate)
+            if m.market_id in self.closed_market_ids:
+                return
+            closed = self.db.close_stop_loss(trade_id, trigger_bid, sell, exit_fee)
+            if not closed:
+                return
+            msg = (
+                f"🛑 PAPER STOP-LOSS {closed['strategy']}\n"
+                f"{closed['event_title']}\n"
+                f"Outcome: {closed['temperature_label']}\n"
+                f"Trigger bid: ${trigger_bid:.3f} ≤ ${STOP_LOSS_PRICE:.2f}\n"
+                f"Exit avg: ${float(closed['exit_price']):.4f}\n"
+                f"Gross: ${float(closed['exit_gross_proceeds']):.4f}\n"
+                f"Exit fee: ${float(closed['exit_fee']):.5f}\n"
+                f"Net returned: ${float(closed['exit_net_proceeds']):.4f}\n"
+                f"PnL: {fmt_money(float(closed['pnl']))}"
+            )
+            log.info(msg.replace("\n", " | "))
+            if self.telegram:
+                await self.telegram.send_message(msg)
+        except Exception as exc:
+            log.exception("Stop-loss processing failed trade=%s: %s", trade_id, exc)
+        finally:
+            self.pending_stop_losses.discard(trade_id)
+
+    @staticmethod
+    def entry_liquidity_window(
+        asks: list[dict[str, float]],
+        max_slippage: float,
+    ) -> tuple[list[dict[str, float]], float | None, float | None, float]:
+        """Return asks close enough to the current best ask and their USD notional depth.
+
+        For paper execution we deliberately ignore far-away asks. A thin book with
+        $0.50 at 0.79 and the rest at 0.95 should not be treated as a realistic $5
+        fill near the signal.
+        """
+        valid: list[dict[str, float]] = []
+        for lvl in asks:
+            try:
+                p = float(lvl["price"])
+                size = float(lvl["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0 < p <= 1 and size > 0:
+                valid.append({"price": p, "size": size})
+        if not valid:
+            return [], None, None, 0.0
+        valid.sort(key=lambda x: x["price"])
+        best_ask = valid[0]["price"]
+        max_price = min(1.0, best_ask + max(0.0, max_slippage))
+        eligible = [lvl for lvl in valid if lvl["price"] <= max_price + 1e-12]
+        notional = sum(lvl["price"] * lvl["size"] for lvl in eligible)
+        return eligible, best_ask, max_price, notional
 
     @staticmethod
     def simulate_market_buy(asks: list[dict[str, float]], target_notional: float) -> FillResult:
@@ -1302,11 +1635,49 @@ class WeatherPaperBot:
         crossed: list[tuple[float, str, int]],
     ) -> None:
         try:
+            # Re-check immediately before simulated execution: resolution/status can
+            # change between the websocket signal and the REST order-book fetch.
+            if m.market_id in self.closed_market_ids:
+                for _threshold, _strategy, signal_id in crossed:
+                    self.db.update_signal(signal_id, "SKIPPED", "MARKET_RESOLVED_BEFORE_FILL")
+                return
+            if not await self.market_accepting_orders(m):
+                for _threshold, _strategy, signal_id in crossed:
+                    self.db.update_signal(signal_id, "SKIPPED", "MARKET_NOT_ACCEPTING_ORDERS")
+                return
             asks = await self.fetch_book_levels(m.yes_token_id)
-            fill = self.simulate_market_buy(asks, TRADE_NOTIONAL_USD)
+            eligible_asks, rest_best_ask, max_entry_price, near_ask_liquidity_usd = self.entry_liquidity_window(
+                asks, MAX_ENTRY_SLIPPAGE
+            )
+            if ENTRY_LIQUIDITY_CHECK_ENABLED:
+                required_liquidity = max(MIN_ENTRY_LIQUIDITY_USD, TRADE_NOTIONAL_USD if REQUIRE_FULL_FILL else 0.0)
+                if rest_best_ask is None or not eligible_asks:
+                    for _threshold, _strategy, signal_id in crossed:
+                        self.db.update_signal(signal_id, "SKIPPED", "NO_ASK_LIQUIDITY")
+                    return
+                if near_ask_liquidity_usd + 1e-9 < required_liquidity:
+                    reason = (
+                        f"INSUFFICIENT_NEAR_ASK_LIQUIDITY available_usd={near_ask_liquidity_usd:.4f} "
+                        f"required_usd={required_liquidity:.4f} best_ask={rest_best_ask:.4f} "
+                        f"max_price={max_entry_price:.4f}"
+                    )
+                    for _threshold, _strategy, signal_id in crossed:
+                        self.db.update_signal(signal_id, "SKIPPED", reason)
+                    log.info(
+                        "SKIP thin ask book market=%s available=$%.4f required=$%.4f range=%.4f..%.4f",
+                        m.market_id, near_ask_liquidity_usd, required_liquidity, rest_best_ask, max_entry_price,
+                    )
+                    return
+            execution_asks = eligible_asks if ENTRY_LIQUIDITY_CHECK_ENABLED else asks
+            fill = self.simulate_market_buy(execution_asks, TRADE_NOTIONAL_USD)
             fee_rate = await self.get_fee_rate(m)
             fee = self.taker_fee(fill, fee_rate)
             top = self.tops.get(m.yes_token_id, TopOfBook())
+
+            if m.market_id in self.closed_market_ids:
+                for _threshold, _strategy, signal_id in crossed:
+                    self.db.update_signal(signal_id, "SKIPPED", "MARKET_RESOLVED_DURING_FILL")
+                return
 
             for threshold, strategy, signal_id in crossed:
                 if fill.shares <= 0 or fill.avg_price is None:
@@ -1368,6 +1739,8 @@ class WeatherPaperBot:
                 log.info(msg.replace("\n", " | "))
                 if self.telegram:
                     await self.telegram.send_message(msg)
+                if STOP_LOSS_ENABLED and top.best_bid is not None and 0 < top.best_bid <= STOP_LOSS_PRICE:
+                    self.maybe_trigger_stop_losses(m.yes_token_id, top.best_bid)
         except Exception as exc:
             log.exception("Crossing processing failed market=%s: %s", m.market_id, exc)
             for _, _, signal_id in crossed:
@@ -1434,6 +1807,25 @@ class WeatherPaperBot:
         await asyncio.gather(*(check_one(mid) for mid in ids))
         self.last_resolution_scan_at = iso_now()
 
+    async def stop_loss_scan_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(STOP_LOSS_SCAN_INTERVAL)
+                if not STOP_LOSS_ENABLED:
+                    continue
+                for tr in self.db.open_trades():
+                    token = str(tr["yes_token_id"])
+                    m = self.markets_by_yes.get(token)
+                    if not m or m.market_id in self.closed_market_ids:
+                        continue
+                    top = self.tops.get(token)
+                    if top and top.best_bid is not None and 0 < top.best_bid <= STOP_LOSS_PRICE:
+                        self.maybe_trigger_stop_losses(token, top.best_bid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Stop-loss scan error: %s", exc)
+
     async def resolution_loop(self) -> None:
         while True:
             try:
@@ -1447,6 +1839,7 @@ class WeatherPaperBot:
 
     async def settle_market(self, m: MarketInfo, yes_value: float, outcome: str, source: str) -> None:
         resolved_at = iso_now()
+        self.closed_market_ids.add(m.market_id)
         self.db.mark_market_resolved(m.market_id, yes_value, resolved_at)
         settled = self.db.settle_trades(m.market_id, yes_value, outcome, source, resolved_at)
         if not settled:
@@ -1501,6 +1894,8 @@ class WeatherPaperBot:
             "🌡 WEATHER PAPER STATUS",
             f"Active city/date events: {events}",
             f"Tracked YES markets: {markets}",
+            f"Paper entries: {'▶️ RUNNING' if self.trading_enabled else '⏹ STOPPED'}",
+            f"Stop-loss: {'ON @ $' + format(STOP_LOSS_PRICE, '.2f') if STOP_LOSS_ENABLED else 'OFF'}",
             f"WebSocket: {'CONNECTED' if self.ws_connected else 'DISCONNECTED'}",
             f"Last discovery: {self.last_discovery_at or '—'}",
             "",
@@ -1510,7 +1905,7 @@ class WeatherPaperBot:
                 f"{s['strategy']} ({s['threshold']:.2f})",
                 f"Equity ${s['equity']:.2f} | cash ${s['cash']:.2f}",
                 f"PnL {fmt_money(s['total_pnl'])} | ROI {s['roi_pct']:+.2f}%",
-                f"Trades {s['trades']} | open {s['open_count']} | W/L {s['wins']}/{s['losses']} | WR {s['win_rate']:.1f}%",
+                f"Trades {s['trades']} | open {s['open_count']} | SL {s['stop_loss_count']} | W/L {s['wins']}/{s['losses']} | WR {s['win_rate']:.1f}%",
                 f"Fees ${s['fees']:.4f} | Max DD {s['max_drawdown_pct']:.2f}%",
                 "",
             ])
@@ -1549,17 +1944,57 @@ class WeatherPaperBot:
         if not self.telegram or not self.telegram.enabled:
             return
         help_text = (
+            "Кнопки управления paper-ботом:\n"
+            "▶️ Старт — разрешить новые виртуальные входы\n"
+            "⏹ Стоп — запретить новые входы; стоп-лосс и resolution продолжают работать\n"
+            "📂 Позиции — открытые позиции\n"
+            "📊 Отчёт — текущая статистика + ZIP\n\n"
             "/status — balances and PnL\n"
-            "/stats — same strategy comparison\n"
-            "/open — open positions\n"
             "/last — latest trades\n"
             "/markets — current market counts\n"
-            "/report — ZIP report now\n"
-            "/help — commands"
+            "/help — show this menu"
         )
         while True:
             updates = await self.telegram.get_updates()
             for update in updates:
+                callback = update.get("callback_query") or {}
+                if callback:
+                    callback_id = str(callback.get("id") or "")
+                    data = str(callback.get("data") or "")
+                    cb_msg = callback.get("message") or {}
+                    chat_id = cb_msg.get("chat", {}).get("id")
+                    if chat_id is None:
+                        await self.telegram.answer_callback(callback_id)
+                        continue
+                    if TELEGRAM_CHAT_ID and str(chat_id) != str(TELEGRAM_CHAT_ID):
+                        await self.telegram.answer_callback(callback_id, "Not authorized")
+                        continue
+                    if data == "paper_start":
+                        self.set_trading_enabled(True)
+                        await self.telegram.answer_callback(callback_id, "Paper trading started")
+                        await self.telegram.send_message(
+                            "▶️ Новые PAPER-входы ВКЛЮЧЕНЫ.\nСтоп-лосс и resolution активны.",
+                            chat_id, self.telegram_keyboard(),
+                        )
+                    elif data == "paper_stop":
+                        self.set_trading_enabled(False)
+                        await self.telegram.answer_callback(callback_id, "New entries stopped")
+                        await self.telegram.send_message(
+                            "⏹ Новые PAPER-входы ОСТАНОВЛЕНЫ.\nОткрытые позиции НЕ закрываются: stop-loss $%.2f и resolution продолжают работать." % STOP_LOSS_PRICE,
+                            chat_id, self.telegram_keyboard(),
+                        )
+                    elif data == "paper_positions":
+                        await self.telegram.answer_callback(callback_id)
+                        await self.telegram.send_message(self.open_text(), chat_id, self.telegram_keyboard())
+                    elif data == "paper_report":
+                        await self.telegram.answer_callback(callback_id, "Building report")
+                        await self.telegram.send_message(self.status_text(), chat_id, self.telegram_keyboard())
+                        path = self.build_report_zip()
+                        await self.telegram.send_document(path, "Weather paper-trading report", chat_id)
+                    else:
+                        await self.telegram.answer_callback(callback_id)
+                    continue
+
                 msg = update.get("message") or {}
                 text = str(msg.get("text") or "").strip()
                 chat_id = msg.get("chat", {}).get("id")
@@ -1569,20 +2004,21 @@ class WeatherPaperBot:
                     continue
                 command = text.split()[0].split("@")[0].lower()
                 if command in {"/start", "/help"}:
-                    await self.telegram.send_message(help_text, chat_id)
+                    await self.telegram.send_message(help_text, chat_id, self.telegram_keyboard())
                 elif command in {"/status", "/stats"}:
-                    await self.telegram.send_message(self.status_text(), chat_id)
+                    await self.telegram.send_message(self.status_text(), chat_id, self.telegram_keyboard())
                 elif command == "/open":
-                    await self.telegram.send_message(self.open_text(), chat_id)
+                    await self.telegram.send_message(self.open_text(), chat_id, self.telegram_keyboard())
                 elif command == "/last":
-                    await self.telegram.send_message(self.latest_text(), chat_id)
+                    await self.telegram.send_message(self.latest_text(), chat_id, self.telegram_keyboard())
                 elif command == "/markets":
                     events, markets = self.db.active_counts()
                     await self.telegram.send_message(
                         f"Tracked active city/date events: {events}\nTracked active YES markets: {markets}\nAll markets ever seen: {self.db.total_market_count()}",
-                        chat_id,
+                        chat_id, self.telegram_keyboard(),
                     )
                 elif command == "/report":
+                    await self.telegram.send_message(self.status_text(), chat_id, self.telegram_keyboard())
                     path = self.build_report_zip()
                     await self.telegram.send_document(path, "Weather paper-trading report", chat_id)
             await asyncio.sleep(0.2)
@@ -1616,7 +2052,9 @@ class WeatherPaperBot:
                     f"Thresholds: {THRESHOLDS}\n"
                     f"Requested notional per signal: ${TRADE_NOTIONAL_USD}\n"
                     f"Starting balance per strategy: ${START_BALANCE_USD}\n"
-                    "Execution: real public CLOB ask depth, paper only.\n"
+                    f"New paper entries: {'RUNNING' if self.trading_enabled else 'STOPPED'}\n"
+                    f"Stop-loss: {'enabled at best bid <= $' + format(STOP_LOSS_PRICE, '.2f') if STOP_LOSS_ENABLED else 'disabled'}\n"
+                    "Execution: real public CLOB depth, paper only.\n"
                     "PnL includes simulated taker fees.\n"
                     "No real orders, wallet, signing, private key, or on-chain redeem.\n"
                 ).encode("utf-8"),
@@ -1663,6 +2101,9 @@ class WeatherPaperBot:
             "paper_trading": True,
             "real_trading": False,
             "ws_connected": self.ws_connected,
+            "new_entries_enabled": self.trading_enabled,
+            "stop_loss_enabled": STOP_LOSS_ENABLED,
+            "stop_loss_price": STOP_LOSS_PRICE,
             "tracked_markets": len(self.markets_by_yes),
             "time": iso_now(),
         })
@@ -1677,6 +2118,9 @@ class WeatherPaperBot:
             "active_events": events,
             "active_yes_markets": markets,
             "ws_connected": self.ws_connected,
+            "new_entries_enabled": self.trading_enabled,
+            "stop_loss_enabled": STOP_LOSS_ENABLED,
+            "stop_loss_price": STOP_LOSS_PRICE,
             "last_ws_message_at": self.last_ws_message_at,
             "last_discovery_at": self.last_discovery_at,
             "strategies": self.all_stats(),
@@ -1698,7 +2142,7 @@ class WeatherPaperBot:
                   <div class="metric">Cash <b>${s['cash']:.2f}</b></div>
                   <div class="metric">Realized <b>{s['realized_pnl']:+.2f}</b></div>
                   <div class="metric">Unrealized <b>{s['unrealized_pnl']:+.2f}</b></div>
-                  <div class="metric">Trades <b>{s['trades']}</b> · open {s['open_count']}</div>
+                  <div class="metric">Trades <b>{s['trades']}</b> · open {s['open_count']} · SL {s['stop_loss_count']}</div>
                   <div class="metric">W/L <b>{s['wins']}/{s['losses']}</b> · WR {s['win_rate']:.1f}%</div>
                   <div class="metric">Fees <b>${s['fees']:.4f}</b></div>
                   <div class="metric">Max DD <b>{s['max_drawdown_pct']:.2f}%</b></div>
@@ -1736,7 +2180,9 @@ small{{color:#a8b4d4}} a{{color:#9fc2ff}}
 <h1>🌡 Polymarket Highest Temperature — PAPER</h1>
 <div class="top"><span class="badge">REAL trading: OFF</span><span class="badge">WS: {'CONNECTED' if self.ws_connected else 'DISCONNECTED'}</span>
 <span class="badge">City/date events: {events}</span><span class="badge">YES markets: {markets}</span>
-<span class="badge">Order: ${TRADE_NOTIONAL_USD:.2f}</span></div>
+<span class="badge">Order: ${TRADE_NOTIONAL_USD:.2f}</span>
+<span class="badge">Entries: {'RUNNING' if self.trading_enabled else 'STOPPED'}</span>
+<span class="badge">SL: ${STOP_LOSS_PRICE:.2f}</span></div>
 <div class="grid">{''.join(cards)}</div>
 <div class="card" style="margin-top:14px"><b>Last discovery:</b> {html.escape(self.last_discovery_at or '—')} &nbsp; <b>Last WS:</b> {html.escape(self.last_ws_message_at or '—')}<br>
 <small>Unrealized PnL is marked at best bid (liquidation-side mark). Page refreshes every 30 seconds.</small></div>

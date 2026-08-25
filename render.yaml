@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: polymarket-weather-paper-bot
+    name: polymarket-weather-paper-bot-v2
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
@@ -14,9 +14,9 @@ services:
       - key: PYTHON_VERSION
         value: 3.13.7
       - key: DB_PATH
-        value: /var/data/weather_paper.db
+        value: /var/data/weather_paper_v2.db
       - key: REPORT_DIR
-        value: /var/data/reports
+        value: /var/data/reports_v2
       - key: THRESHOLDS
         value: 0.79,0.84,0.89
       - key: TRADE_NOTIONAL_USD
@@ -24,6 +24,22 @@ services:
       - key: START_BALANCE_USD
         value: 1000
       - key: HOURLY_REPORTS
+        value: true
+      - key: STOP_LOSS_ENABLED
+        value: true
+      - key: STOP_LOSS_PRICE
+        value: 0.40
+      - key: STOP_LOSS_SCAN_INTERVAL_SECONDS
+        value: 5
+      - key: TRADING_ENABLED_ON_START
+        value: true
+      - key: ENTRY_LIQUIDITY_CHECK_ENABLED
+        value: true
+      - key: MIN_ENTRY_LIQUIDITY_USD
+        value: 5
+      - key: MAX_ENTRY_SLIPPAGE
+        value: 0.02
+      - key: REQUIRE_FULL_FILL
         value: true
       - key: TELEGRAM_BOT_TOKEN
         sync: false
