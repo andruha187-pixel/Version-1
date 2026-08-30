@@ -1,0 +1,35 @@
+MULTI7 FIRST-V2 CONSENSUS F/G/H/J parity check
+==============================================================================
+
+Unchanged functions from prior MULTI7 A/B/C/E source:
+- _first_v2_eligible_candidates: EXACT
+  SHA256: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+- market_symbol: EXACT
+  SHA256: 94685f8c2df27b941e307b68534cc8e797783994b02ad0f0f3f4511448b87341
+- parse_market_from_event: EXACT
+  SHA256: 08e0ef18fd1a6b4648469f2d14103c51d0e26ea83ea95c417886a3868f7b3000
+- discover_slot_market: EXACT
+  SHA256: d55de22613c31f1135d87c2e783a8809035357d076f75805ce30a92f77000347
+- persist_market: EXACT
+  SHA256: 2425fee19ec274b538c4d0bfe666827e407137a134c73027d9ab0baffc97afc0
+- execute_paper: EXACT
+  SHA256: 0c30b4bb6e319f20abd33d39555d5b04be13ddbad8cff796193eb8a81155fc16
+- momentum_for: EXACT
+  SHA256: 02c2535f3d95f418ed9a6c4252b864104c4e336a29e6a4735035c17110acdf90
+
+Intentional experiment changes:
+- Strategy set is F/G/H/J only; 4 per token, 28 PAPER accounts.
+- A new market-wide v2_votes tape records exactly the first V2-eligible signal
+  per token/market using the unchanged _first_v2_eligible_candidates function.
+- Consensus source is FIRST V2-eligible vote, not SAFE67 PASS.
+- F target 0.67..0.70 + >=1 distinct other same-side V2 vote / 10 sec.
+- G target 0.67..0.70 + >=2 distinct other same-side V2 votes / 10 sec.
+- H same entry as G + safer one-time DCA:
+  arm <=0.50; later ask 0.30..0.60; rebound +0.05..+0.15; <=120 sec.
+- J target 0.67..0.75 + >=2 distinct other same-side V2 votes / 10 sec.
+- F/G/J have no DCA. All strategies have no stop-loss and no switch.
+- Same decision-cycle first-V2 votes receive one shared timestamp to prevent
+  token iteration order from creating artificial consensus differences.
+
+Regression result:
+MULTI7 FIRST-V2 CONSENSUS F/G/H/J regression: OK
