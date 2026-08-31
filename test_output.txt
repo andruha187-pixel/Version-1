@@ -1,1 +1,3 @@
-MULTI7 FIRST-V2 CONSENSUS F/G/H/J regression: OK
+MULTI7 F/G/H/J fee-adjusted +$0.10 profit-stop regression: OK
+Example 0.68 entry -> arm 0.7300 -> calculated +$0.10 stop 0.729060 -> realized PnL +0.100000
+H 0.68 + 0.40 equal-size buys -> weighted gross avg 0.5400, arm 0.5900, +$0.10 stop 0.583033
