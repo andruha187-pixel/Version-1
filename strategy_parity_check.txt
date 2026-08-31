@@ -1,1 +1,17 @@
-Strategy parity check: OK — FIRST-V2/F/G/H/J/DCA unchanged; only BE protection/runtime/reporting changed.
+MULTI7 F/G/H/J signal parity after fast profit-stop patch
+========================================================================
+_strategy_set: EXACT | sha256=97157561c3fe9b5ee0479e75a7915872f65bdeb9bafa8673521a0d7d4efadf4f
+momentum_for: EXACT | sha256=760c2635e0d72945457f34c75afc1b95f784def2306be1af94201b1c64c7278c
+_first_v2_eligible_candidates: EXACT | sha256=d379c46dd4662bfe4c31e5c249fd0924d4b25aa121d99bc4dc8ab8053d379dda
+record_first_v2_vote: EXACT | sha256=6bba17e174a72975f596abf0359e1589fe0c633da96c7bcd31bafd0f3479ea0a
+consensus_confirmations: EXACT | sha256=27962b86ae8c012b6a114ed77dad170ef1cfc58f8a001ba0cbae675c69f7961f
+store_consensus_event: EXACT | sha256=f97c66d27aac0272dab6607a6c014f8ecda7cc2246be37728a1406d2250a5338
+evaluate_consensus_variant: EXACT | sha256=14439b98b77ddfe9992d847de6904f4cb19164c284f540373c050b9642c20719
+arm_dca: EXACT | sha256=14368ee877fac316058c40c49ebb2423a9e1af2ea5f5ed8572ea1d4cf51deba4
+mark_dca_filled: EXACT | sha256=bf59020c0dd30816411bd97f0cebc43e660a9207f7531cc1e085fb5f8da0092f
+
+Intentional changes only:
+- profit protection moved out of the 3.0s strategy loop into a 0.25s watcher
+- arming pass no longer forces one extra wait before a possible trigger
+- per-position action lock prevents DCA/ENTRY execution racing a stop exit
+- H DCA is blocked once profit protection is already armed

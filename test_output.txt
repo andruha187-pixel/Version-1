@@ -1,3 +1,11 @@
-MULTI7 F/G/H/J fee-adjusted +$0.10 profit-stop regression: OK
-Example 0.68 entry -> arm 0.7300 -> calculated +$0.10 stop 0.729060 -> realized PnL +0.100000
-H 0.68 + 0.40 equal-size buys -> weighted gross avg 0.5400, arm 0.5900, +$0.10 stop 0.583033
+2026-08-31 18:46:37,996 [INFO] BUY BTC_F_TIGHT_ONE_V2   ENTRY   Up   | 5.00sh @ 0.6800 fee=0.0762 | cash 500.00 -> 496.52
+2026-08-31 18:46:38,002 [INFO] BE ARMED BTC_F_TIGHT_ONE_V2       normal | Up bid=0.7300 | configured-arm=0.7300 | effective-arm=0.7300 | profit-stop=0.7291 target=$0.10
+2026-08-31 18:46:38,014 [WARNING] BE TRIGGER BTC_F_TIGHT_ONE_V2     normal | Up bid=0.7291 <= profit-stop=0.7291 | target=$0.10 | elapsed=61.0s
+2026-08-31 18:46:38,017 [WARNING] BE STOP SELL BTC_F_TIGHT_ONE_V2   Up   | 5.00/5.00sh @ 0.7291 fee=0.0691 | net 3.5762 | remaining 0.0000
+2026-08-31 18:46:38,051 [INFO] BUY BTC_F_TIGHT_ONE_V2   ENTRY   Up   | 1.00sh @ 0.6800 fee=0.0152 | cash 500.10 -> 499.40
+2026-08-31 18:46:38,058 [INFO] BE ARMED BTC_F_TIGHT_ONE_V2       artial | Up bid=0.8062 | configured-arm=0.7300 | effective-arm=0.8062 | profit-stop=0.8062 target=$0.10
+2026-08-31 18:46:38,062 [WARNING] BE TRIGGER BTC_F_TIGHT_ONE_V2     artial | Up bid=0.8062 <= profit-stop=0.8062 | target=$0.10 | elapsed=60.1s
+2026-08-31 18:46:38,066 [WARNING] BE STOP SELL BTC_F_TIGHT_ONE_V2   Up   | 1.00/1.00sh @ 0.8062 fee=0.0109 | net 0.7952 | remaining 0.0000
+normal 5sh stop=0.729060 pnl=+0.100000
+partial 1sh same-pass stop=0.806170 pnl=+0.100000
+FAST PROFIT-STOP regression: OK

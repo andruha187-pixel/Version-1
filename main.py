@@ -36,7 +36,7 @@ load_dotenv()
 # PAPER ONLY.
 # ============================================================
 
-VERSION = "16.2-paper-multi7-consensus-fghj-profit10"
+VERSION = "16.3-paper-multi7-consensus-fghj-profit10-faststop"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -75,6 +75,7 @@ CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
 BREAKEVEN_STOP_ENABLED = os.getenv("BREAKEVEN_STOP_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 BREAKEVEN_TRIGGER_MOVE = float(os.getenv("BREAKEVEN_TRIGGER_MOVE", "0.05"))
 BREAKEVEN_MIN_PROFIT_USDC = float(os.getenv("BREAKEVEN_MIN_PROFIT_USDC", "0.10"))
+BREAKEVEN_WATCH_INTERVAL = max(0.05, float(os.getenv("BREAKEVEN_WATCH_INTERVAL", "0.25")))
 DISCOVERY_INTERVAL = float(os.getenv("DISCOVERY_INTERVAL", "10"))
 MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
 
@@ -215,13 +216,13 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "safe67_multi7_consensus_fghj_profit10.db"
+DB_PATH = DATA_DIR / "safe67_multi7_consensus_fghj_profit10_faststop.db"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("safe67-multi7-consensus-fghj-be")
+log = logging.getLogger("safe67-multi7-consensus-fghj-faststop")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -232,6 +233,17 @@ ws_send_queue: asyncio.Queue = asyncio.Queue()
 price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
 strategy_state = {}
 settle_lock = asyncio.Lock()
+position_action_locks = {}
+
+
+def position_action_lock(condition, variant_name):
+    """Serialize buy/DCA and fast protective exits for one strategy position."""
+    key = (str(condition), str(variant_name))
+    lock = position_action_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        position_action_locks[key] = lock
+    return lock
 
 
 # ============================================================
@@ -998,6 +1010,9 @@ def cleanup_resolved_market_memory():
     for key in list(strategy_state):
         if key[0] in old_cids:
             strategy_state.pop(key, None)
+    for key in list(position_action_locks):
+        if key[0] in old_cids:
+            position_action_locks.pop(key, None)
 
     keep_assets = set()
     for m in markets.values():
@@ -1388,7 +1403,7 @@ async def process_breakeven_stop(market, variant, elapsed):
 
     The default floor targets +$0.10 total modeled PnL after entry and exit fees.
     Protection stays active even when global trading is STOPPED. Once triggered,
-    liquidation attempts continue on following decision cycles until the paper
+    liquidation attempts continue on following fast-watcher passes until the paper
     position is fully closed or the market ends.
     """
     if not BREAKEVEN_STOP_ENABLED or not variant.get("breakeven_stop_enabled", True):
@@ -1402,6 +1417,9 @@ async def process_breakeven_stop(market, variant, elapsed):
     asset = pos["primary_asset"]
     if not asset:
         return False
+    # Use the WebSocket book when fresh; REST-refresh only if it has gone stale.
+    # This prevents the fast watcher from triggering on an old bid after a WS hiccup.
+    await ensure_book(asset)
     bid = best_bid(asset)
     if bid is None:
         return False
@@ -1427,7 +1445,12 @@ async def process_breakeven_stop(market, variant, elapsed):
                 variant["name"], cid[-6:], outcome, bid,
                 configured_arm_trigger, arm_trigger, stop_price, BREAKEVEN_MIN_PROFIT_USDC,
             )
-        return True  # never trigger on the arming tick
+        # Do NOT force a wait until another strategy tick. The fast watcher may
+        # arm and trigger in the same pass if the current executable bid is already
+        # at/below the fee-adjusted profit floor (important for partial fills/gaps).
+        ev = breakeven_event(cid, variant["name"])
+        if ev is None:
+            return False
 
     # Recalculate stop from the actual total position/cost basis (important if H DCA
     # occurred before arming or if a prior stop attempt only partially filled).
@@ -1462,11 +1485,18 @@ async def process_breakeven_stop(market, variant, elapsed):
     return True
 
 
-async def execute_paper(condition, variant, asset, outcome, signal_type):
+async def _execute_paper_unlocked(condition, variant, asset, outcome, signal_type):
     age = await ensure_book(asset)
 
-    # Once the breakeven stop has triggered, never add risk afterward.
+    # Once the profit protection has triggered, never add risk afterward.
     if stop_triggered(condition, variant["name"]):
+        return False
+
+    # If protection is already ARMED, it owns the position from this point on.
+    # In particular, H must not race a 3-second DCA against a 0.25-second stop exit
+    # after price has already crossed the protected-profit region.
+    if str(signal_type).upper() != "ENTRY" and breakeven_event(condition, variant["name"]) is not None:
+        log.info("BUY BLOCK %s %s | profit protection already armed", variant["name"], signal_type)
         return False
 
     wanted = ENTRY_ORDER_SIZE if signal_type == "ENTRY" else DCA_ORDER_SIZE
@@ -1523,6 +1553,13 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
         name, signal_type, outcome, filled, avg, fee, cash, after,
     )
     return True
+
+
+async def execute_paper(condition, variant, asset, outcome, signal_type):
+    # Fast stop watcher and 3-second strategy engine may run concurrently.
+    # Serialize actions for this exact strategy position so a DCA cannot race a stop exit.
+    async with position_action_lock(condition, variant["name"]):
+        return await _execute_paper_unlocked(condition, variant, asset, outcome, signal_type)
 
 
 def _first_v2_eligible_candidates(market, variant):
@@ -1853,6 +1890,72 @@ def record_position_trajectory(market, variant, elapsed):
     return True
 
 
+def open_protected_position_keys():
+    """Return only unresolved PAPER positions that still have shares open."""
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT t.condition_id, t.variant,
+                   SUM(t.filled_shares) AS bought,
+                   COALESCE(MAX(e.exited),0) AS exited
+            FROM paper_trades t
+            LEFT JOIN market_results r
+              ON r.condition_id=t.condition_id AND r.variant=t.variant
+            LEFT JOIN (
+                SELECT condition_id,variant,SUM(filled_shares) AS exited
+                FROM paper_exits GROUP BY condition_id,variant
+            ) e ON e.condition_id=t.condition_id AND e.variant=t.variant
+            WHERE r.condition_id IS NULL
+            GROUP BY t.condition_id,t.variant
+            HAVING SUM(t.filled_shares)-COALESCE(MAX(e.exited),0) > 0.00000001
+        """).fetchall()
+    return [(str(r["condition_id"]), str(r["variant"])) for r in rows]
+
+
+def market_for_condition(condition_id):
+    market = markets.get(str(condition_id))
+    if market:
+        return market
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM discovered_markets WHERE condition_id=?",
+            (str(condition_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+async def breakeven_watch_once():
+    """One fast protection pass; entry/V2/momentum logic is intentionally absent."""
+    n = time.time()
+    for cid, variant_name in open_protected_position_keys():
+        variant = STRATEGY_BY_NAME.get(variant_name)
+        if not variant or not variant.get("breakeven_stop_enabled", True):
+            continue
+        market = market_for_condition(cid)
+        if not market:
+            continue
+        elapsed = n - sf(market.get("start_ts"))
+        # Covers the whole 5-minute market plus a small resolution grace period.
+        if elapsed < -30 or elapsed > 310:
+            continue
+        lock = position_action_lock(cid, variant_name)
+        if lock.locked():
+            continue
+        async with lock:
+            await process_breakeven_stop(market, variant, elapsed)
+
+
+async def breakeven_watch_loop():
+    while True:
+        started = time.monotonic()
+        try:
+            if BREAKEVEN_STOP_ENABLED:
+                await breakeven_watch_once()
+        except Exception:
+            log.exception("Fast BE/profit watcher failed")
+        spent = time.monotonic() - started
+        await asyncio.sleep(max(0.01, BREAKEVEN_WATCH_INTERVAL - spent))
+
+
 async def strategy_loop():
     while True:
         started = time.monotonic()
@@ -1885,11 +1988,8 @@ async def strategy_loop():
                     continue
                 trade_ready.append((market, elapsed, variants))
 
-            # Phase 0: protective BE exits. These remain active even if START is OFF.
-            # Running them before DCA prevents H from adding risk after the BE stop fires.
-            for market, elapsed, variants in active:
-                for variant in variants:
-                    await process_breakeven_stop(market, variant, elapsed)
+            # Protective exits are intentionally NOT handled in this 3-second loop.
+            # breakeven_watch_loop() watches only open positions at its own fast cadence.
 
             # Phase 1: capture the FIRST V2-eligible vote for every token using
             # one common decision-cycle timestamp.
@@ -2414,7 +2514,7 @@ async def telegram_loop():
         f"Assets: {', '.join(SYMBOLS)}\n"
         f"Accounts: {len(STRATEGIES)} × ${PAPER_START_BALANCE:.0f}\n"
         f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
-        f"BE/profit stop: {'ON' if BREAKEVEN_STOP_ENABLED else 'OFF'} | arm +{BREAKEVEN_TRIGGER_MOVE:.2f} | target +${BREAKEVEN_MIN_PROFIT_USDC:.2f} | hourly reports OFF."
+        f"BE/profit stop: {'ON' if BREAKEVEN_STOP_ENABLED else 'OFF'} | watch {BREAKEVEN_WATCH_INTERVAL:.2f}s | arm +{BREAKEVEN_TRIGGER_MOVE:.2f} | target +${BREAKEVEN_MIN_PROFIT_USDC:.2f} | hourly reports OFF."
     )
     while True:
         try:
@@ -2504,6 +2604,7 @@ async def health(request):
             "enabled": BREAKEVEN_STOP_ENABLED,
             "arm_move": BREAKEVEN_TRIGGER_MOVE,
             "target_profit_usdc": BREAKEVEN_MIN_PROFIT_USDC,
+            "watch_interval_sec": BREAKEVEN_WATCH_INTERVAL,
             "basis": "weighted gross entry average",
             "exit": "best-bid monitored paper liquidation",
         },
@@ -2538,6 +2639,7 @@ async def main():
         asyncio.create_task(discovery_loop()),
         asyncio.create_task(ws_loop()),
         asyncio.create_task(strategy_loop()),
+        asyncio.create_task(breakeven_watch_loop()),
         asyncio.create_task(resolution_fallback_loop()),
         asyncio.create_task(telegram_loop()),
         asyncio.create_task(memory_maintenance_loop()),
@@ -2545,9 +2647,9 @@ async def main():
     log.info(
         "%s started | symbols=%s | accounts=%d | "
         "F=TIGHT+1V2 | G=TIGHT+2V2 | H=G+SAFE-DCA | J=WIDE+2V2 | "
-        "window=%gs | BE-arm=+%.2f | profit-floor=$%.2f fee-adjusted | reports=OFF | trading=%s",
+        "window=%gs | strategy-cycle=%.2fs | BE-watch=%.2fs | BE-arm=+%.2f | profit-floor=$%.2f fee-adjusted | reports=OFF | trading=%s",
         VERSION, ",".join(SYMBOLS), len(STRATEGIES),
-        CONSENSUS_WINDOW_SEC, BREAKEVEN_TRIGGER_MOVE, BREAKEVEN_MIN_PROFIT_USDC,
+        CONSENSUS_WINDOW_SEC, DECISION_INTERVAL, BREAKEVEN_WATCH_INTERVAL, BREAKEVEN_TRIGGER_MOVE, BREAKEVEN_MIN_PROFIT_USDC,
         "ON" if trading_enabled() else "OFF",
     )
     try:
