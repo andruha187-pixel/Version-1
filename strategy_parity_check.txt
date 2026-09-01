@@ -1,17 +1,41 @@
-MULTI7 F/G/H/J signal parity after fast profit-stop patch
-========================================================================
-_strategy_set: EXACT | sha256=97157561c3fe9b5ee0479e75a7915872f65bdeb9bafa8673521a0d7d4efadf4f
-momentum_for: EXACT | sha256=760c2635e0d72945457f34c75afc1b95f784def2306be1af94201b1c64c7278c
-_first_v2_eligible_candidates: EXACT | sha256=d379c46dd4662bfe4c31e5c249fd0924d4b25aa121d99bc4dc8ab8053d379dda
-record_first_v2_vote: EXACT | sha256=6bba17e174a72975f596abf0359e1589fe0c633da96c7bcd31bafd0f3479ea0a
-consensus_confirmations: EXACT | sha256=27962b86ae8c012b6a114ed77dad170ef1cfc58f8a001ba0cbae675c69f7961f
-store_consensus_event: EXACT | sha256=f97c66d27aac0272dab6607a6c014f8ecda7cc2246be37728a1406d2250a5338
-evaluate_consensus_variant: EXACT | sha256=14439b98b77ddfe9992d847de6904f4cb19164c284f540373c050b9642c20719
-arm_dca: EXACT | sha256=14368ee877fac316058c40c49ebb2423a9e1af2ea5f5ed8572ea1d4cf51deba4
-mark_dca_filled: EXACT | sha256=bf59020c0dd30816411bd97f0cebc43e660a9207f7531cc1e085fb5f8da0092f
+MULTI7 SAFE67 A/B/C/E + NET TAKE-PROFIT parity check
+==============================================================================
 
-Intentional changes only:
-- profit protection moved out of the 3.0s strategy loop into a 0.25s watcher
-- arming pass no longer forces one extra wait before a possible trigger
-- per-position action lock prevents DCA/ENTRY execution racing a stop exit
-- H DCA is blocked once profit protection is already armed
+Exact unchanged functions from uploaded source:
+- _strategy_set: EXACT | SHA256 2a70385c0b7b2069bfa29adfe4f594eadf6d2b8c42a0e7333fefa368f2c83f60
+- _first_v2_eligible_candidates: EXACT | SHA256 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+- consensus_confirmations: EXACT | SHA256 aa5285217041b963e8e4f8cd12e662c36635ad635a169d190abd4f7c0bb67c92
+- market_symbol: EXACT | SHA256 94685f8c2df27b941e307b68534cc8e797783994b02ad0f0f3f4511448b87341
+- strategies_for_market: EXACT | SHA256 22ac964d43b52443e34156954fe0440884044b544747f9a10f744317c9743d24
+- parse_market_from_event: EXACT | SHA256 08e0ef18fd1a6b4648469f2d14103c51d0e26ea83ea95c417886a3868f7b3000
+- discover_slot_market: EXACT | SHA256 d55de22613c31f1135d87c2e783a8809035357d076f75805ce30a92f77000347
+- persist_market: EXACT | SHA256 2425fee19ec274b538c4d0bfe666827e407137a134c73027d9ab0baffc97afc0
+- fee_usdc: EXACT | SHA256 a5464e05087689efa912810a191550d7029de9c2aaadf5759676c16ea8df9e2d
+- simulate_buy: EXACT | SHA256 636792028bd7e85f16b31c2480f04ff99c09388ec845b16c0b3ec6a5429bb3ce
+- simulate_sell: EXACT | SHA256 0c2b27a0882e702c1ca4c0a349f5919fd518422bdccb68a67c57d2f6b38e14cf
+- momentum_for: EXACT | SHA256 02c2535f3d95f418ed9a6c4252b864104c4e336a29e6a4735035c17110acdf90
+- store_gate_decision: EXACT | SHA256 25a914308e5526eab3a8b423438c76b3838f506a4c48455089617291eed4cc2d
+- store_signal: EXACT | SHA256 338a7c6b42b65004cc08a1e1d95f5bfeaea9f5e92155207f1f97b422b99a0389
+- arm_dca: EXACT | SHA256 7afd9cbb82903e08c98d15e2c47779ed846c38d4399f4d6d30b6ef5846f7da63
+- mark_dca_filled: EXACT | SHA256 04d32b9383ffdc82f775df4c369b8aafee283bbfede3d12d4a646552895ef422
+
+Normalized strategy-engine parity:
+- evaluate_variant: EXACT after removing only TP-closed early-return guard
+- evaluate_consensus_variant: EXACT after removing only TP-closed early-return guard
+- execute_paper: EXACT after removing only full-exit duplicate-buy guard
+- strategy_loop: EXACT after removing only TP monitor call/comment
+
+Intentional additions:
+- TAKE_PROFIT_USDC from .env; default 0.30; OFF/0 disables.
+- Threshold is whole-position NET PnL after entry fees AND executable exit fees.
+- Full remaining size must be executable into visible bids; no partial TP.
+- Bid book is freshness-checked and NET PnL recalculated before exit.
+- TP monitoring runs every ~3 sec through elapsed<=305 sec.
+- Existing open positions remain TP-monitored even when STOP blocks new entries.
+- TP creates paper_exits reason=TAKE_PROFIT and immediately finalizes the variant result.
+- After TP, that strategy cannot re-enter or DCA the same market.
+- Hourly ZIP now includes paper_exits.csv.
+- Fresh DB/report paths isolate this experiment from prior A/B/C/E data.
+
+Original regression: MULTI7 SAFE67 A/B/C/E regression: OK
+TP regression: MULTI7 A/B/C/E configurable NET TAKE-PROFIT regression: OK
