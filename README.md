@@ -1,356 +1,382 @@
-# MULTI7 SAFE67 — A / B / C / E + configurable NET take-profit
+# MULTI7 PRE-JUMP LAB
 
-PAPER-only experiment on seven Polymarket 5-minute crypto chains:
+Version: `1.0-multi7-prejump-lab`
+
+A separate **PAPER-only research bot** for studying whether external crypto-exchange microstructure can improve the current Polymarket SAFE67 entry, veto bad entries, or detect a move before Polymarket reaches the usual 0.67 entry zone.
+
+This project does **not** send real Polymarket orders and does not replace the current LIVE bot.
+
+## Markets
+
+Default symbols:
 
 ```text
-BTC
-XRP
-BNB
-SOL
-ETH
-DOGE
-HYPE (Hyperliquid)
+BTC,XRP,BNB,SOL,ETH,DOGE,HYPE
 ```
 
-There are **4 independent strategies per token = 28 PAPER accounts**.  
-Each account starts at `$500` by default.
+There are four independent PAPER strategies per token, therefore 28 PAPER accounts. Each starts at `$500` by default.
 
-There is **no stop-loss** in any strategy.
+## Strategies
 
-## Configurable NET take-profit
+### BASE
 
-All A/B/C/E PAPER positions now use one global `.env` setting:
+Benchmark reproducing the current SAFE67-style entry, ENTRY only:
 
 ```text
-TAKE_PROFIT_USDC=0.30
+first V2 eligible:
+  ask       0.55..0.75
+  momentum +0.03..+0.30
+
+after first V2 signal, SAFE entry:
+  ask       0.67..0.75
+  momentum +0.05..+0.10
+  size      5 shares
 ```
 
-`0.30` means: close the **entire remaining position** only when the currently
-executable sell into visible bids would leave at least **+$0.30 total net PnL**.
+The BASE signal is sampled on the normal approximately 3-second decision loop. No DCA, no stop, no switch.
 
-The calculation includes:
+### EXT_CONFIRM
+
+Same SAFE67 entry as BASE, but the external microstructure must confirm the same direction at the moment of the first SAFE67 gate:
 
 ```text
-all entry gross cost
-+ all entry commissions
-- any prior net exit proceeds
-- projected current sell proceeds
-+ current exit commission
+directional external score >= +0.30
+same-direction venue votes >= 2
 ```
 
-In formula form:
+No DCA, no stop, no switch.
+
+### EXT_VETO
+
+Same SAFE67 signal as BASE, except an entry is blocked when external order flow strongly contradicts the Polymarket direction:
 
 ```text
-NET PnL = prior exit net + current projected sell net - total buy cost
+directional external score <= -0.20
+opposing venue votes >= 2
 ```
 
-So the take-profit is **after both entry and exit commissions**.
+This strategy tests whether external data is more useful as a filter than as a trigger.
 
-Examples:
+### PRE_JUMP
+
+Experimental earlier entry intended to test the idea of entering before Polymarket reaches 0.67:
 
 ```text
-TAKE_PROFIT_USDC=0.30   -> close at >= +$0.30 net
-TAKE_PROFIT_USDC=0.50   -> close at >= +$0.50 net
-TAKE_PROFIT_USDC=1.00   -> close at >= +$1.00 net
-TAKE_PROFIT_USDC=OFF    -> disable
-TAKE_PROFIT_USDC=0      -> disable
+Polymarket ask           0.52..0.66
+absolute external score >= 0.55
+same-direction votes    >= 2
+elapsed                  5..160 sec
+Polymarket 1s momentum  -0.01..+0.05
 ```
 
-A decimal comma is also accepted, e.g. `0,30`.
-
-The bot requires enough visible bid liquidity to sell **100% of the remaining
-shares**. It does not partially close just to hit the target. When the local
-book first appears to reach the target, the bid-side book is freshness-checked
-and the full net PnL is recalculated before the PAPER sell is recorded.
-
-For B/C after a DCA, the target is still **+$0.30 for the whole 10-share
-position**, not $0.30 per share.
-
-TP monitoring continues for already-open positions even when `STOP` blocks new
-entries, so `STOP` does not strand an existing PAPER position.
-
-A successful take-profit is written to:
+By default PRE_JUMP additionally requires **both Binance and Bybit** to vote in the same direction:
 
 ```text
-paper_exits.csv
-reason = TAKE_PROFIT
+PREJUMP_REQUIRE_BINANCE_BYBIT=1
 ```
 
-and Telegram sends the actual average exit price and NET PnL.
+This intentionally tries to avoid buying after the Polymarket move has already happened.
 
-## Common signal engine
+## External data sources
 
-All strategies keep the same first-V2 concept:
+The lab uses public WebSocket market data; no Binance/Bybit/Coinbase trading API keys are required.
+
+### Binance USD-M Futures
+
+Default high-frequency endpoint:
 
 ```text
-V2 eligible:
-price    0.55..0.75
-momentum 0.03..0.30
-lookback 2 decision ticks
-
-decision loop ~3 seconds
-trade window first 180 seconds
-no side switching
-no pre-decision REST refresh
+wss://fstream.binance.com/public/stream
 ```
 
-The first V2-eligible signal decides that strategy's market gate permanently.
-
-## A — SAFE67 BASE
+Per token the bot consumes:
 
 ```text
-ENTRY price    0.67..0.75
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
-
-No DCA
-No stop-loss
-Max position 5 shares
+{symbol}@aggTrade
+{symbol}@depth20@100ms
 ```
 
-This is the clean BASE control.
+It derives taker BUY/SELL notional flow and a top-20 order-book snapshot.
 
-## B — SAFE67 REVERSAL DCA
+### Bybit USDT Linear
 
-The previous B logic is preserved:
+Endpoint:
 
 ```text
-ENTRY price    0.67..0.75
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
-
-DCA arm:
-held-side ask <= 0.50
-elapsed <= 120 sec
-NO BUY on the arming tick
-
-Later rebound:
-momentum >= +0.05
-ask <= 0.60
-DCA size = 5 shares
-one DCA only
+wss://stream.bybit.com/v5/public/linear
 ```
 
-B deliberately has **no new 0.30 floor and no +0.15 momentum cap**. This keeps it as the old DCA control.
-
-## C — TIGHT ENTRY + SAFER DCA
-
-This is the new variant we agreed to test:
+Per token:
 
 ```text
-ENTRY price    0.67..0.70
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
+orderbook.50.SYMBOL
+publicTrade.SYMBOL
+allLiquidation.SYMBOL
 ```
 
-DCA:
+The bot uses order-book changes, taker-side trades and liquidation direction.
+
+### Coinbase Spot
+
+Endpoint:
 
 ```text
-arm when held-side ask <= 0.50
-do not buy on the arm tick
-
-on a later tick:
-ask      0.30..0.60
-momentum +0.05..+0.15
-elapsed  <= 120 sec
-
-DCA = 5 shares
-one DCA only
-max position = 10 shares
+wss://advanced-trade-ws.coinbase.com
 ```
 
-If a rebound happens below `0.30`, C does **not** buy it.  
-If rebound momentum is above `+0.15`, C also does **not** buy it.
-
-No stop-loss.
-
-## E — SAFE67 CROSS-TOKEN CONSENSUS
-
-E uses the same target-token entry threshold as A:
+Default mapped products:
 
 ```text
-target price    0.67..0.75
-target momentum 0.05..0.10
-ENTRY size      5 shares
+BTC -> BTC-USD
+ETH -> ETH-USD
+SOL -> SOL-USD
+XRP -> XRP-USD
+DOGE -> DOGE-USD
 ```
 
-But the entry is allowed only if, at the target's first SAFE67 decision:
+Coinbase BNB/HYPE are left unmapped by default. The bot consumes `level2`, `market_trades` and `heartbeats`.
+
+## What the external score contains
+
+For each available venue the lab calculates:
 
 ```text
-at least 2 DISTINCT OTHER tokens
-had an A/BASE SAFE67 PASS
-in the SAME direction
-within the previous 10 seconds
+price return:        1s / 3s / 10s
+taker flow:          1s / 3s / 10s
+flow acceleration:   flow_1s - flow_10s
+order-book imbalance
+microprice offset
+spread
+bid/ask depth
+1s bid-depth change
+1s ask-depth change
+liquidity pressure
+3s liquidation flow
 ```
 
-Example:
+Current experimental venue score:
 
 ```text
-ETH A -> UP
-SOL A -> UP
-BTC E target -> UP
+0.28 * taker_flow_1s
+0.17 * taker_flow_3s
+0.16 * tanh(return_1s / 6 bps)
+0.10 * tanh(return_3s / 15 bps)
+0.10 * order_book_imbalance
+0.07 * tanh(microprice_bps / 1.5)
+0.08 * liquidity_pressure
+0.04 * liquidation_flow_3s
 ```
 
-If both ETH and SOL votes are inside the 10-second window:
+The result is clamped to `[-1,+1]`.
+
+Cross-exchange weighting:
 
 ```text
-BTC E -> BUY 5 shares
+Binance  40%
+Bybit    40%
+Coinbase 20%
 ```
 
-Rules:
+Only fresh sources are included and weights are renormalized when a venue is unavailable.
 
-- the target token itself never counts;
-- one other token counts at most once;
-- only **A/BASE SAFE67 PASS** is used as a vote;
-- opposite-side signals do not count;
-- if fewer than 2 confirmations exist at the first target SAFE67 decision, E skips that market permanently;
-- E does not wait for confirmations to appear later;
-- E has no DCA and no stop-loss.
-
-The strategy loop is two-phase: all A/B/C decisions for all active tokens are processed first from the shared ~3-second WebSocket snapshot, then E is evaluated. This means genuinely simultaneous same-cycle A signals can count as consensus; signals that arrive in later cycles cannot revive an already-skipped E market.
-
-## Hourly ZIP
-
-One combined ZIP is sent each hour.
-
-Root:
+A venue vote requires:
 
 ```text
-variants_summary.csv
-markets.csv
+abs(venue_score) >= 0.25
+```
+
+These thresholds are deliberately hypotheses for PAPER collection, not claimed optimums.
+
+## Chainlink note
+
+This first lab version does **not** claim to read the actual Chainlink Data Streams settlement reference. Direct Data Streams access requires credentials/authentication.
+
+Instead the bot stores:
+
+```text
+external_open_proxy
+external_gap_bps
+```
+
+`external_open_proxy` is the median of fresh exchange prices around the beginning of the 5-minute market. It is explicitly only an exchange-price proxy, **not Chainlink**.
+
+A direct Chainlink adapter can be added later if Data Streams credentials are available.
+
+## The important research dataset: what happened BEFORE a jump
+
+A Polymarket jump is currently defined as:
+
+```text
+outcome ASK rises >= 0.08 within 5 seconds
+```
+
+For every detected jump, `jump_events.csv` stores external-feature snapshots from approximately:
+
+```text
+1 second before
+3 seconds before
+5 seconds before
+10 seconds before
+20 seconds before
+```
+
+That allows later analysis of which combinations of flow, order-book changes, cross-exchange votes and liquidations repeatedly occur before Polymarket moves.
+
+## Trading objective labels
+
+The research target is not only whether the 5-minute market ultimately resolves correctly. For every PAPER entry the bot also asks:
+
+> Would this entry have offered a fully executable `+$0.60 NET` exit within the next 3, 5, 10 or 20 seconds?
+
+`trials_3_5_10_20s.csv` records:
+
+```text
+max_net_3s
+max_net_5s
+max_net_10s
+max_net_20s
+hit_tp_3s
+hit_tp_5s
+hit_tp_10s
+hit_tp_20s
+```
+
+This is aligned with the current bot's small take-profit trading style.
+
+## PAPER take-profit
+
+Default:
+
+```text
+TAKE_PROFIT_USDC=0.60
+```
+
+It is the NET profit target for the whole position after entry fees and projected exit fees. The PAPER exit requires enough visible Polymarket bid liquidity to liquidate the full remaining position.
+
+## Sampling rates
+
+External feature / PRE_JUMP loop:
+
+```text
+FAST_INTERVAL=0.25
+```
+
+Feature persistence:
+
+```text
+FEATURE_PERSIST_INTERVAL=0.50
+```
+
+BASE / EXT_CONFIRM / EXT_VETO decision sampling:
+
+```text
+BASE_DECISION_INTERVAL=3.0
+```
+
+The external collectors themselves process incoming WebSocket messages as they arrive; the 250 ms interval is the feature/decision calculation cadence.
+
+## Hourly ZIP report
+
+The bot sends one ZIP per completed hour containing:
+
+```text
 report.txt
-```
-
-Each token has four folders, for example:
-
-```text
-BTC/A_safe67_base_5sh/
-BTC/B_safe67_reversal_dca_5plus5/
-BTC/C_tight67_70_safer_dca_5plus5/
-BTC/E_safe67_consensus_5sh/
-```
-
-The same structure exists for XRP, BNB, SOL, ETH, DOGE and HYPE.
-
-Every strategy folder contains:
-
-```text
-summary.csv
-gate_decisions.csv
+strategy_summary.csv
+external_features.csv
+jump_events.csv
+signal_events.csv
 paper_trades.csv
 paper_exits.csv
-dca_events.csv
-consensus_events.csv
-signals.csv
+trials_3_5_10_20s.csv
 market_results.csv
-position_trajectory.csv
-report.txt
+source_health.csv
 ```
 
-For E, `consensus_events.csv` records:
+These files are intended to be sent back to ChatGPT for offline comparison and threshold search.
 
-```text
-target token
-target side
-target ask
-target momentum
-required confirmation count
-actual confirmation count
-confirming symbols
-age of each confirmation in milliseconds
-PASS/SKIP reason
-```
-
-This lets us later compare 2-vote vs 3-vote consensus and 5/10/15-second windows without guessing.
+After a successfully sent report, old high-frequency feature/source-health rows are pruned with overlap to control disk usage. Jump events, trials, signals, trades and results remain available.
 
 ## Telegram
 
-Buttons stay:
+Buttons:
 
 ```text
 START
 STOP
-BALANCE
 STATISTICS
+SOURCES
 POSITIONS
 TRADES
-PAPER
-LIVE
-EMERGENCY STOP
+LAB INFO
 ```
 
-LIVE is disabled in this experiment.
+External data collection always runs. `STOP` only blocks new PAPER entries; it does not stop data collection or TP monitoring for already-open PAPER positions.
 
-`STATISTICS` reports A/B/C/E separately for each token, including DCA armed/filled for B/C and consensus pass/checked for E.
+For this research bot, PAPER entry collection defaults to ON after a fresh database so a forgotten START does not waste hours of data.
 
-## Render
+Use `SOURCES` to verify Binance, Bybit and Coinbase freshness before trusting PRE_JUMP results.
 
-Build:
+## Coolify / Render
+
+This is PAPER-only, so **do not add a Polymarket private key**.
+
+Minimum environment variables:
 
 ```text
-pip install -r requirements.txt
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+PORT=8080
+DATA_DIR=/var/data
+SYMBOLS=BTC,XRP,BNB,SOL,ETH,DOGE,HYPE
+
+ENABLE_BINANCE=1
+ENABLE_BYBIT=1
+ENABLE_COINBASE=1
+TAKE_PROFIT_USDC=0.60
 ```
 
-Start:
-
-```text
-python main.py
-```
-
-Persistent disk:
+Use persistent storage:
 
 ```text
 /var/data
 ```
 
-Fresh DB:
+Health endpoint:
 
 ```text
-/var/data/safe67_multi7_abce_takeprofit.db
+/health
 ```
 
-Hourly reports:
+A Dockerfile is included. On Coolify use Dockerfile build and expose port `8080`.
+
+## Recommended first run
+
+Do not tune the thresholds after a handful of trades. Let the lab collect at least a full day, preferably 1–3 days, then compare:
 
 ```text
-/var/data/safe67_multi7_abce_takeprofit_reports
+BASE vs EXT_CONFIRM vs EXT_VETO vs PRE_JUMP
+TP-hit rate at 3/5/10/20 sec
+win rate at settlement
+PnL after fees
+score distribution before winning vs losing jumps
+1 vs 2 vs 3 confirming venues
+PRE_JUMP entry price bands
 ```
 
-After a fresh deploy trading starts OFF. Press `START`.
+The goal of this version is to **collect enough synchronized raw evidence to discover whether a repeatable pre-jump edge exists**, not to assume one in advance.
 
-## Verification
-
-`strategy_parity_check.txt` verifies that the uploaded A/B/C/E strategy remains
-unchanged except for the take-profit hooks:
-
-- `_strategy_set`, first-V2 selection, consensus source, market parsing,
-  fee formula, buy/sell book simulation, momentum and DCA helpers are byte-exact;
-- `evaluate_variant` and `evaluate_consensus_variant` differ only by the
-  `take_profit_closed` early-return guard;
-- the original buy path differs only by a guard preventing a new buy after a
-  full TP exit;
-- the strategy loop differs only by the TP monitor call.
-
-Run both regressions:
+## Tests
 
 ```text
-python test_multi7_abce.py
-python test_takeprofit.py
+python test_prejump_lab.py
+python test_source_parsers.py
 ```
 
 Expected:
 
 ```text
-MULTI7 SAFE67 A/B/C/E regression: OK
-MULTI7 A/B/C/E configurable NET TAKE-PROFIT regression: OK
+MULTI7 PRE-JUMP LAB regression: OK
+External source message parser regression: OK
 ```
 
-The TP regression explicitly checks:
-
-- 5 shares bought at `0.68`;
-- executable sell at `0.76` does **not** close because NET PnL is below `$0.30`;
-- a high price with insufficient bid depth does **not** partially close;
-- executable full sell at `0.77` closes with about `+$0.31186` NET;
-- both entry and exit fees are included;
-- the closed strategy cannot buy/DCA again;
-- later market resolution does not add a second payout;
-- hourly ZIP contains `paper_exits.csv` with `reason=TAKE_PROFIT`.
+The parser regression uses official-shaped WebSocket fixtures. Live external connectivity cannot be guaranteed by an offline test environment; after deployment use Telegram `SOURCES` to verify real source freshness.
